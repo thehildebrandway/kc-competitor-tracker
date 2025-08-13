@@ -1,0 +1,54 @@
+name: Weekly IG Competitor Tracker
+
+on:
+  schedule:
+    - cron: '0 16 * * 1'
+  workflow_dispatch:
+
+jobs:
+  run-tracker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Recreate service_account.json from secret
+        run: |
+          echo "$GCP_SA_JSON_B64" | base64 -d > service_account.json
+        env:
+          GCP_SA_JSON_B64: ${{ secrets.GCP_SA_JSON_B64 }}
+
+      - name: Install dependencies
+        run: |
+          pip install instaloader pandas gspread oauth2client pytz
+
+      - name: Generate config.json
+        run: |
+          cat > config.json << 'EOF'
+          {
+            "brand_handle": "${{ secrets.BRAND_HANDLE }}",
+            "days_back": 30,
+            "google_sheets": {
+              "enabled": true,
+              "service_account_json_path": "service_account.json",
+              "sheet_name": "${{ secrets.SHEET_NAME }}",
+              "posts_raw_tab": "${{ secrets.POSTS_TAB }}",
+              "weekly_summary_tab": "${{ secrets.SUMMARY_TAB }}"
+            },
+            "scheduling": {
+              "timezone": "${{ secrets.TIMEZONE }}"
+            }
+          }
+          EOF
+
+      - name: Run tracker
+        run: |
+          python instaloader_tracker.py --config config.json competitors.csv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: posts_raw_csv
+          path: posts_raw.csv
