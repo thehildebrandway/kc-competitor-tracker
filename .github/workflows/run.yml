@@ -1,12 +1,13 @@
-name: Weekly IG Competitor Tracker (Keyless)
+name: Weekly IG Competitor Tracker (Apify)
 
 on:
   schedule:
-    - cron: '0 16 * * 1'  # Mondays 08:00 PT (16:00 UTC)
-  workflow_dispatch:        # also gives you a "Run workflow" button
+    - cron: '0 16 * * 1'   # Mondays 08:00 PT (16:00 UTC)
+  workflow_dispatch:
+  push:                    # optional: keeps a convenient first-run trigger
 
 permissions:
-  contents: write   # allow the workflow to commit the CSV back to the repo
+  contents: write
 
 jobs:
   run-tracker:
@@ -22,45 +23,83 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install instaloader pandas pytz python-dateutil
+          pip install pandas python-dateutil pytz requests
 
-      - name: Run tracker (CSV only, last 30 days)
+      - name: Run Apify Instagram Scraper for all handles
+        env:
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
         run: |
           python - << 'PY'
-          import instaloader, pandas as pd
+          import os, json, time, requests, pandas as pd
           from datetime import datetime, timedelta
 
-          handles = [h.strip() for h in open('competitors.csv') if h.strip()]
-          L = instaloader.Instaloader(download_pictures=False, download_videos=False,
-                                      save_metadata=False, compress_json=False)
-          since = datetime.utcnow() - timedelta(days=30)
+          token = os.environ["APIFY_TOKEN"]
+          # Read handles
+          handles = [h.strip() for h in open("competitors.csv") if h.strip()]
+
+          # Apify actor: apify/instagram-scraper
+          # We'll run once with all usernames. Limit results to last 60 days just to be safe.
+          since_dt = datetime.utcnow() - timedelta(days=60)
+
+          input_payload = {
+              "usernames": handles,           # list of usernames without @
+              "resultsType": "posts",
+              "resultsLimit": 200,           # total cap (actor-level)
+              "includeCommentCount": True,
+              "includeLikeCount": True,
+              "includeCaption": True,
+              "scrollWaitSecs": 1
+          }
+
+          run_url = f"https://api.apify.com/v2/acts/apify~instagram-scraper/run-sync-get-dataset-items?token={token}"
+          r = requests.post(run_url, json=input_payload, timeout=600)
+          r.raise_for_status()
+          items = r.json()
 
           rows = []
-          for h in handles:
+          for it in items:
+              # Skip if not a post item
+              if it.get("type") not in ("Post","Reel","Carousel"):
+                  continue
+              username = it.get("ownerUsername") or ""
+              url = it.get("url") or ""
+              caption = (it.get("caption") or "").replace("\n"," ").strip()
+              likes = it.get("likesCount") or 0
+              comments = it.get("commentsCount") or 0
+              ts = it.get("timestamp") or it.get("takenAtTimestamp")
+              # Normalize time
               try:
-                  p = instaloader.Profile.from_username(L.context, h)
-                  followers = p.followers or 0
-                  for post in p.get_posts():
-                      if post.date_utc < since:
-                          break
-                      rows.append({
-                        "platform":"instagram",
-                        "profile":"@"+h,
-                        "post_url":f"https://www.instagram.com/p/{post.shortcode}/",
-                        "published_at":post.date_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        "type":"reel" if post.is_video else ("carousel" if post.typename=="GraphSidecar" else "image"),
-                        "caption":(post.caption or "").replace("\n"," ").strip()[:500],
-                        "hook_text":" ".join(((post.caption or "").split()[:10])),
-                        "likes":post.likes or 0,
-                        "comments":post.comments or 0,
-                        "followers_snapshot":followers,
-                        "est_engagement_rate": round(((post.likes or 0)+(post.comments or 0))/followers,4) if followers else 0.0
-                      })
-              except Exception as e:
-                  print("WARN", h, e)
+                  published_at = datetime.fromtimestamp(ts).strftime("%Y-%m-%dT%H:%M:%SZ")
+                  dt_utc = datetime.fromtimestamp(ts)
+              except Exception:
+                  published_at, dt_utc = "", None
+              if dt_utc and dt_utc < since_dt:
+                  continue
+
+              # Guess type
+              _type = "reel" if it.get("isVideo") else ("carousel" if (it.get("imagesCount") or 0) > 1 else "image")
+              followers = it.get("ownerFollowersCount") or 0
+              er = round((likes + comments)/followers, 4) if followers else 0.0
+              hook_text = " ".join(caption.split()[:10])
+
+              rows.append({
+                  "platform":"instagram",
+                  "profile":"@"+username if username else "",
+                  "post_url": url,
+                  "published_at": published_at,
+                  "type": _type,
+                  "caption": caption[:500],
+                  "hook_text": hook_text,
+                  "likes": likes,
+                  "comments": comments,
+                  "followers_snapshot": followers,
+                  "est_engagement_rate": er
+              })
 
           df = pd.DataFrame(rows)
+          df.sort_values("published_at", ascending=False, inplace=True)
           df.to_csv("posts_raw.csv", index=False)
+          print(f"Wrote {len(df)} rows to posts_raw.csv")
           PY
 
       - name: Commit CSV to repo
