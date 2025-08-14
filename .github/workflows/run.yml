@@ -1,4 +1,30 @@
-      - name: Run Apify Instagram Scraper for all handles
+name: Weekly IG Competitor Tracker (Apify, simple)
+
+on:
+  workflow_dispatch:        # manual button
+  schedule:
+    - cron: "0 16 * * 1"    # Mondays 08:00 PT
+
+permissions:
+  contents: write
+
+jobs:
+  run-tracker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install pandas python-dateutil pytz requests
+
+      - name: Scrape with Apify and build CSV
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
         run: |
@@ -6,22 +32,21 @@
           import os, json, requests, pandas as pd
           from datetime import datetime, timedelta
 
-          token = os.environ.get("APIFY_TOKEN", "")
-          if not token or len(token) < 10:
-              raise SystemExit("APIFY_TOKEN is missing or invalid. Add it as a repo secret.")
+          token = os.environ.get("APIFY_TOKEN", "").strip()
+          if not token:
+              raise SystemExit("Missing APIFY_TOKEN repo secret. Add it in Settings → Secrets → Actions.")
 
-          # Read IG handles (one per line, no @)
-          handles = [h.strip() for h in open("competitors.csv") if h.strip()]
+          # usernames file: one per line, no @
+          handles = [h.strip().lstrip("@") for h in open("competitors.csv") if h.strip()]
 
-          # Call Apify actor
-          ACTOR = "apify~instagram-scraper"
-          url = f"https://api.apify.com/v2/acts/{ACTOR}/run-sync-get-dataset-items"
+          # call Apify actor (free tier OK for weekly pulls)
+          url = "https://api.apify.com/v2/acts/apify~instagram-scraper/run-sync-get-dataset-items"
           headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
           payload = {
               "usernames": handles,
               "resultsType": "posts",
-              "resultsLimit": 200,
+              "resultsLimit": 250,
               "includeCommentCount": True,
               "includeLikeCount": True,
               "includeCaption": True,
@@ -30,73 +55,70 @@
 
           r = requests.post(url, headers=headers, json=payload, timeout=600)
           if r.status_code == 401:
-              raise SystemExit("Apify 401 Unauthorized: token wrong/expired. Create a fresh APIFY_TOKEN secret.")
+              raise SystemExit("Apify 401 Unauthorized: APIFY_TOKEN invalid/expired or not added as secret.")
           r.raise_for_status()
-          items = r.json()
+          items = r.json() or []
 
-          since_dt = datetime.utcnow() - timedelta(days=60)
-
-          def normalize_ts(it):
-              # Try multiple fields Apify may return
+          # normalize timestamps (Apify sometimes returns different keys)
+          def ts_to_iso(it):
               for k in ("timestamp","takenAtTimestamp","taken_at_timestamp"):
                   v = it.get(k)
-                  if isinstance(v, (int, float)):
-                      return datetime.utcfromtimestamp(v)
-                  # ISO string case
+                  if isinstance(v, (int,float)):
+                      return datetime.utcfromtimestamp(v).strftime("%Y-%m-%dT%H:%M:%SZ")
                   if isinstance(v, str):
                       try:
-                          return datetime.fromisoformat(v.replace("Z","+00:00")).replace(tzinfo=None)
+                          return datetime.fromisoformat(v.replace("Z","+00:00")).strftime("%Y-%m-%dT%H:%M:%SZ")
                       except Exception:
                           pass
-              return None
+              return ""
 
           rows = []
-          for it in items or []:
-              t = it.get("type") or ""
-              if t not in ("Post","Reel","Carousel"):
+          for it in items:
+              t = (it.get("type") or "").lower()
+              if t not in ("post","reel","carousel"):
                   continue
-
-              uname = (it.get("ownerUsername") or "").strip("@")
-              dt_utc = normalize_ts(it)
-              if dt_utc and dt_utc < since_dt:
-                  continue
-
+              uname = (it.get("ownerUsername") or "").lstrip("@")
               caption = (it.get("caption") or "").replace("\n"," ").strip()
               likes = int(it.get("likesCount") or 0)
               comments = int(it.get("commentsCount") or 0)
               followers = int(it.get("ownerFollowersCount") or 0)
-              url_post = it.get("url") or ""
-
-              # Decide type
-              is_video = bool(it.get("isVideo"))
               images_count = int(it.get("imagesCount") or 0)
+              is_video = bool(it.get("isVideo"))
               ptype = "reel" if is_video else ("carousel" if images_count > 1 else "image")
 
               rows.append({
-                  "platform":"instagram",
-                  "profile": f"@{uname}" if uname else "",
-                  "post_url": url_post,
-                  "published_at": dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ") if dt_utc else "",
-                  "type": ptype,
-                  "caption": caption[:500],
-                  "hook_text": " ".join(caption.split()[:10]),
-                  "likes": likes,
-                  "comments": comments,
-                  "followers_snapshot": followers,
-                  "est_engagement_rate": round((likes+comments)/followers,4) if followers else 0.0
+                "platform": "instagram",
+                "profile": f"@{uname}" if uname else "",
+                "post_url": it.get("url") or "",
+                "published_at": ts_to_iso(it),
+                "type": ptype,
+                "caption": caption[:500],
+                "hook_text": " ".join(caption.split()[:10]),
+                "likes": likes,
+                "comments": comments,
+                "followers_snapshot": followers,
+                "est_engagement_rate": round((likes+comments)/followers, 4) if followers else 0.0
               })
 
-          # Guarantee a non-empty CSV with headers
           cols = ["platform","profile","post_url","published_at","type","caption","hook_text","likes","comments","followers_snapshot","est_engagement_rate"]
           df = pd.DataFrame(rows, columns=cols)
 
-          # Sort only if we actually have any published_at values
-          if "published_at" in df.columns and df["published_at"].notna().any():
+          # sort safely if we have any timestamps
+          if not df.empty and df["published_at"].fillna("").ne("").any():
               df = df.sort_values("published_at", ascending=False, na_position="last")
 
+          # never write an empty file (helps Sheets/Raw)
           if df.empty:
               df.loc[0] = ["instagram","","","","","","NO DATA RETURNED",0,0,0,0.0]
 
           df.to_csv("posts_raw.csv", index=False)
           print(f"Wrote {len(df)} rows to posts_raw.csv")
           PY
+
+      - name: Commit CSV to repo
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add posts_raw.csv
+          git commit -m "chore: update posts_raw.csv [skip ci]" || echo "No changes to commit"
+          git push
