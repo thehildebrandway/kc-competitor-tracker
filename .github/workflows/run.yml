@@ -1,4 +1,4 @@
-name: Weekly IG Competitor Tracker (Apify, simple)
+name: Weekly IG Competitor Tracker (Apify, per-handle)
 
 on:
   workflow_dispatch:        # manual button
@@ -12,31 +12,35 @@ jobs:
   run-tracker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           persist-credentials: true
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           pip install pandas python-dateutil pytz requests
 
-           - name: Scrape with Apify and build CSV (per-handle, proxy on)
+      - name: Scrape with Apify and build CSV (per-handle, proxy on)
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
         run: |
           python - << 'PY'
           import os, json, time, requests, pandas as pd
-          from datetime import datetime, timedelta
+          from datetime import datetime
 
           token = os.environ.get("APIFY_TOKEN", "").strip()
           if not token:
-              raise SystemExit("Missing APIFY_TOKEN repo secret. Add it in Settings → Secrets → Actions.")
+              raise SystemExit("Missing APIFY_TOKEN secret. Add it in Settings → Secrets → Actions.")
 
+          # read usernames one per line, no @
           handles = [h.strip().lstrip("@") for h in open("competitors.csv") if h.strip()]
+
           ACTOR = "apify~instagram-scraper"
           RUN_URL = f"https://api.apify.com/v2/acts/{ACTOR}/run-sync-get-dataset-items"
           HEADERS = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -56,14 +60,14 @@ jobs:
           all_rows = []
           for uname in handles:
               payload = {
-                  "usernames": [uname],              # one handle per run
+                  "usernames": [uname],           # one handle per run to avoid batch quirks
                   "resultsType": "posts",
                   "resultsLimit": 120,
                   "includeCommentCount": True,
                   "includeLikeCount": True,
                   "includeCaption": True,
                   "scrollWaitSecs": 1,
-                  "proxy": {"useApifyProxy": True}   # important for reliability
+                  "proxy": {"useApifyProxy": True}
               }
               try:
                   r = requests.post(RUN_URL, headers=HEADERS, json=payload, timeout=600)
@@ -101,14 +105,14 @@ jobs:
                       "est_engagement_rate": round((likes+comments)/followers, 4) if followers else 0.0
                   })
 
-              # tiny pause to be nice to the API
-              time.sleep(2)
+              time.sleep(2)  # be nice to API
 
           cols = ["platform","profile","post_url","published_at","type","caption","hook_text","likes","comments","followers_snapshot","est_engagement_rate"]
           df = pd.DataFrame(all_rows, columns=cols)
 
           if not df.empty and df["published_at"].fillna("").ne("").any():
               df = df.sort_values("published_at", ascending=False, na_position="last")
+
           if df.empty:
               df.loc[0] = ["instagram","","","","","","NO DATA RETURNED",0,0,0,0.0]
 
