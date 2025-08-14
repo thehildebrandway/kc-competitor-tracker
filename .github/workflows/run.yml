@@ -24,46 +24,27 @@ jobs:
         run: |
           pip install pandas python-dateutil pytz requests
 
-      - name: Scrape with Apify and build CSV
+           - name: Scrape with Apify and build CSV (per-handle, proxy on)
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
         run: |
           python - << 'PY'
-          import os, json, requests, pandas as pd
+          import os, json, time, requests, pandas as pd
           from datetime import datetime, timedelta
 
           token = os.environ.get("APIFY_TOKEN", "").strip()
           if not token:
               raise SystemExit("Missing APIFY_TOKEN repo secret. Add it in Settings → Secrets → Actions.")
 
-          # usernames file: one per line, no @
           handles = [h.strip().lstrip("@") for h in open("competitors.csv") if h.strip()]
+          ACTOR = "apify~instagram-scraper"
+          RUN_URL = f"https://api.apify.com/v2/acts/{ACTOR}/run-sync-get-dataset-items"
+          HEADERS = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-          # call Apify actor (free tier OK for weekly pulls)
-          url = "https://api.apify.com/v2/acts/apify~instagram-scraper/run-sync-get-dataset-items"
-          headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-          payload = {
-              "usernames": handles,
-              "resultsType": "posts",
-              "resultsLimit": 250,
-              "includeCommentCount": True,
-              "includeLikeCount": True,
-              "includeCaption": True,
-              "scrollWaitSecs": 1
-          }
-
-          r = requests.post(url, headers=headers, json=payload, timeout=600)
-          if r.status_code == 401:
-              raise SystemExit("Apify 401 Unauthorized: APIFY_TOKEN invalid/expired or not added as secret.")
-          r.raise_for_status()
-          items = r.json() or []
-
-          # normalize timestamps (Apify sometimes returns different keys)
           def ts_to_iso(it):
               for k in ("timestamp","takenAtTimestamp","taken_at_timestamp"):
                   v = it.get(k)
-                  if isinstance(v, (int,float)):
+                  if isinstance(v, (int, float)):
                       return datetime.utcfromtimestamp(v).strftime("%Y-%m-%dT%H:%M:%SZ")
                   if isinstance(v, str):
                       try:
@@ -72,47 +53,67 @@ jobs:
                           pass
               return ""
 
-          rows = []
-          for it in items:
-              t = (it.get("type") or "").lower()
-              if t not in ("post","reel","carousel"):
-                  continue
-              uname = (it.get("ownerUsername") or "").lstrip("@")
-              caption = (it.get("caption") or "").replace("\n"," ").strip()
-              likes = int(it.get("likesCount") or 0)
-              comments = int(it.get("commentsCount") or 0)
-              followers = int(it.get("ownerFollowersCount") or 0)
-              images_count = int(it.get("imagesCount") or 0)
-              is_video = bool(it.get("isVideo"))
-              ptype = "reel" if is_video else ("carousel" if images_count > 1 else "image")
+          all_rows = []
+          for uname in handles:
+              payload = {
+                  "usernames": [uname],              # one handle per run
+                  "resultsType": "posts",
+                  "resultsLimit": 120,
+                  "includeCommentCount": True,
+                  "includeLikeCount": True,
+                  "includeCaption": True,
+                  "scrollWaitSecs": 1,
+                  "proxy": {"useApifyProxy": True}   # important for reliability
+              }
+              try:
+                  r = requests.post(RUN_URL, headers=HEADERS, json=payload, timeout=600)
+                  if r.status_code == 401:
+                      raise SystemExit("Apify 401 Unauthorized: APIFY_TOKEN invalid/expired.")
+                  r.raise_for_status()
+                  items = r.json() or []
+                  print(f"[INFO] {uname}: {len(items)} items")
+              except Exception as e:
+                  print(f"[WARN] {uname}: request failed ({e})")
+                  items = []
 
-              rows.append({
-                "platform": "instagram",
-                "profile": f"@{uname}" if uname else "",
-                "post_url": it.get("url") or "",
-                "published_at": ts_to_iso(it),
-                "type": ptype,
-                "caption": caption[:500],
-                "hook_text": " ".join(caption.split()[:10]),
-                "likes": likes,
-                "comments": comments,
-                "followers_snapshot": followers,
-                "est_engagement_rate": round((likes+comments)/followers, 4) if followers else 0.0
-              })
+              for it in items:
+                  t = (it.get("type") or "").lower()
+                  if t not in ("post","reel","carousel"):
+                      continue
+                  caption = (it.get("caption") or "").replace("\n"," ").strip()
+                  likes = int(it.get("likesCount") or 0)
+                  comments = int(it.get("commentsCount") or 0)
+                  followers = int(it.get("ownerFollowersCount") or 0)
+                  images_count = int(it.get("imagesCount") or 0)
+                  is_video = bool(it.get("isVideo"))
+                  ptype = "reel" if is_video else ("carousel" if images_count > 1 else "image")
+                  all_rows.append({
+                      "platform": "instagram",
+                      "profile": f"@{uname}",
+                      "post_url": it.get("url") or "",
+                      "published_at": ts_to_iso(it),
+                      "type": ptype,
+                      "caption": caption[:500],
+                      "hook_text": " ".join(caption.split()[:10]),
+                      "likes": likes,
+                      "comments": comments,
+                      "followers_snapshot": followers,
+                      "est_engagement_rate": round((likes+comments)/followers, 4) if followers else 0.0
+                  })
+
+              # tiny pause to be nice to the API
+              time.sleep(2)
 
           cols = ["platform","profile","post_url","published_at","type","caption","hook_text","likes","comments","followers_snapshot","est_engagement_rate"]
-          df = pd.DataFrame(rows, columns=cols)
+          df = pd.DataFrame(all_rows, columns=cols)
 
-          # sort safely if we have any timestamps
           if not df.empty and df["published_at"].fillna("").ne("").any():
               df = df.sort_values("published_at", ascending=False, na_position="last")
-
-          # never write an empty file (helps Sheets/Raw)
           if df.empty:
               df.loc[0] = ["instagram","","","","","","NO DATA RETURNED",0,0,0,0.0]
 
           df.to_csv("posts_raw.csv", index=False)
-          print(f"Wrote {len(df)} rows to posts_raw.csv")
+          print(f"[DONE] Wrote {len(df)} rows to posts_raw.csv")
           PY
 
       - name: Commit CSV to repo
