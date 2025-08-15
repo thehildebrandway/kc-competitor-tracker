@@ -1,0 +1,41 @@
+name: IG Competitor Scrape
+
+on:
+  schedule:
+    - cron: "22 12 * * *"   # daily at 12:22 UTC (adjust)
+  workflow_dispatch: {}      # manual Run button
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          IG_SESSIONID: ${{ secrets.IG_SESSIONID }}
+          DAYS_BACK: "30"
+        run: |
+          python scraper.py
+
+      - name: Commit CSV
+        run: |
+          git config user.name "actions-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/posts_raw.csv
+          git commit -m "Update posts_raw.csv [skip ci]" || echo "No changes"
+          git push
